@@ -25,7 +25,11 @@ const (
 
 	defaultSyncWorkerCount = 4
 	defaultSyncBatchSize   = 512 * Blocks
+
+	RebuildWaitingTimeIntervalFile = "/host/var/lib/longhorn/rebuild_waiting_time_interval.cfg"
 )
+
+var WaitingTimeIntervalInRebuild = 25
 
 type DataSyncClient interface {
 	open() error
@@ -282,17 +286,45 @@ func (client *syncClient) processSegment(segment FileInterval) error {
 }
 
 func (client *syncClient) sendHTTPRequest(method string, action string, queries map[string]string, data []byte) (*http.Response, error) {
+	if err := GetRebuildWaitingTimeInterval(); err != nil {
+		log.Errorf("GetRebuildWaitingTimeInterval error: %s, so we will use default WaitingTimeIntervalInRebuild", err.Error())
+	}
 	httpClient := client.httpClient
 	if httpClient == nil {
 		httpClient = newHTTPClient(client.httpClientTimeout)
 	}
+
+	pr, pw := io.Pipe()
+	n := 0
+	go func() {
+		defer pw.Close()
+		sleepTime := time.Microsecond * time.Duration(WaitingTimeIntervalInRebuild)
+		for {
+			if n+BlockSize > len(data) {
+				_, err := pw.Write(data[n:])
+				if err != nil {
+					log.WithError(err)
+					return
+				}
+				break
+			}
+			_, err := pw.Write(data[n : n+BlockSize])
+			if err != nil {
+				log.WithError(err)
+				return
+			}
+			n += BlockSize
+			time.Sleep(sleepTime)
+		}
+	}()
 
 	url := fmt.Sprintf("http://%s/v1-ssync/%s", client.remote, action)
 
 	var req *http.Request
 	var err error
 	if data != nil {
-		req, err = http.NewRequest(method, url, bytes.NewBuffer(data))
+		req, err = http.NewRequest(method, url, pr)
+		req.TransferEncoding = []string{"chunked"}
 	} else {
 		req, err = http.NewRequest(method, url, nil)
 	}
@@ -553,4 +585,25 @@ func (client *syncClient) getLocalChecksum(batchInterval Interval) (dataBuffer, 
 	}
 
 	return dataBuffer, checksum, nil
+}
+
+func GetRebuildWaitingTimeInterval() error {
+	f, errFile := os.OpenFile(RebuildWaitingTimeIntervalFile, os.O_RDWR|os.O_CREATE, 0644)
+	defer f.Close()
+	if errFile != nil {
+		return errFile
+	}
+	num := make([]byte, 10)
+	_, errFile = f.Read(num)
+	if errFile != nil {
+		return errFile
+	}
+	numI, errNum := strconv.Atoi(string(num))
+	if errNum != nil {
+		return errNum
+	}
+	if WaitingTimeIntervalInRebuild != numI {
+		WaitingTimeIntervalInRebuild = numI
+	}
+	return nil
 }
